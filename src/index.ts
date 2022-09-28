@@ -1,30 +1,126 @@
-/**
- * Welcome to Cloudflare Workers! This is your first worker.
- *
- * - Run `wrangler dev src/index.ts` in your terminal to start a development server
- * - Open a browser tab at http://localhost:8787/ to see your worker in action
- * - Run `wrangler publish src/index.ts --name my-worker` to publish your worker
- *
- * Learn more at https://developers.cloudflare.com/workers/
- */
+import { createServer } from '@graphql-yoga/common';
+import { faunaClient, q } from './db';
 
-export interface Env {
-	// Example binding to KV. Learn more at https://developers.cloudflare.com/workers/runtime-apis/kv/
-	// MY_KV_NAMESPACE: KVNamespace;
-	//
-	// Example binding to Durable Object. Learn more at https://developers.cloudflare.com/workers/runtime-apis/durable-objects/
-	// MY_DURABLE_OBJECT: DurableObjectNamespace;
-	//
-	// Example binding to R2. Learn more at https://developers.cloudflare.com/workers/runtime-apis/r2/
-	// MY_BUCKET: R2Bucket;
-}
+let stream: any = null;
 
-export default {
-	async fetch(
-		request: Request,
-		env: Env,
-		ctx: ExecutionContext
-	): Promise<Response> {
-		return new Response("Hello World!");
-	},
-};
+const server = createServer({
+  schema: {
+    typeDefs: /* GraphQL */ `
+      type Post {
+        id: ID!
+        title: String!
+        content: String!
+      }
+      type Query {
+        getPost(id: ID!): Post
+        listPosts: [Post]!
+      }
+      type Mutation {
+        addPost(input: PostInput): Post
+        deletePost(id: ID): Boolean
+        updatePost(id: ID, input: PostInput): Post
+      }
+      type Subscription {
+        onPostChange(id: ID): Post
+      }
+      input PostInput {
+        title: String
+        content: String
+      }
+    `,
+    resolvers: {
+			Query: {
+				getPost: async (_, { id }) => {
+					const post: any = await faunaClient.query(
+						q.Get(q.Ref(q.Collection("Post"), id))
+					);
+					return {...post.data, id};
+				},
+				listPosts: async () => {
+					const posts: any = await faunaClient.query(
+						q.Map(
+							q.Paginate(q.Documents(q.Collection('Post'))),
+							q.Lambda((x: any) => q.Get(x))
+						)
+					);
+					return posts.data.map((post: any) => ({...post.data, id: post.ref.id}));
+				}
+			},
+			Mutation: {
+				addPost: async (parent, { input }) => {
+					try {
+						console.log('input: ', { ...input });
+						const post: any = await faunaClient.query(
+							q.Create(q.Collection("Post"), { data: input })
+						);
+						return {...post.data, id: post.ref.id};						
+					} catch (error) {
+						console.log('error: ', error);	
+					}
+				},
+				deletePost: async (_, { id }) => {
+					try {
+						await faunaClient.query(
+							q.Delete(q.Ref(q.Collection("Post"), id))
+						);
+						return true;
+					} catch (error) {
+						console.log('error: ', error);
+						return false;
+					}
+        },
+				updatePost: async (_, { id, input }) => {
+					try {
+						const post: any = await faunaClient.query(
+							q.Update(q.Ref(q.Collection("Post"), id), { data: input })
+						);
+						return { ...post.data, id };
+					} catch (error) {
+						console.log('error: ', error);
+						return null;
+					}
+        }
+			},
+			Subscription: {
+        onPostChange: {
+          subscribe: async function* (_, { id }) {
+            let currentSnap: any;
+            let newVersion: any;
+            const docRef = q.Ref(q.Collection('Post'), id);
+            if(!stream) {
+              stream = faunaClient.stream.document(docRef).on('snapshot', (snapshot: any) => {
+                currentSnap = {
+                  ts: snapshot.ts,
+                  data: snapshot.data
+                }
+              }).start();
+            } 
+            stream.on('version', (version: any) => {
+              newVersion = {
+                ts: version.document.ts,
+                data: version.document.data
+              }
+            });
+
+            let subscriptionTime = 0; // Terminate Subscription after 1000 seconds
+
+            while (subscriptionTime < 150) {
+              await new Promise(resolve => setTimeout(resolve, 2000, null));
+              subscriptionTime++;
+              if(newVersion && newVersion.ts !== currentSnap.ts) {
+                currentSnap = newVersion;
+                subscriptionTime = 0; // Reset Subscription Time
+                yield { onPostChange: { ...newVersion.data, id} }
+              }
+            }
+            await new Promise(resolve => setTimeout(resolve, 1000, null));
+            stream.close();
+            yield { onPostChange: 'Disconnected' }
+          }
+        },
+      },
+    },
+  },
+})
+
+server.start();

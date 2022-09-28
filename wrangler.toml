@@ -1,3 +1,8 @@
 name = "serverless-fauna-cloudflare"
 main = "src/index.ts"
 compatibility_date = "2022-09-27"
+node_compat = true
+
+[vars]
+FAUNA_SECRET = "fnAExiEC8eAAyxMRasSlWEq_4x3o74rzr9UEi4HW"
+FAUNA_DOMAIN = "db.eu.fauna.com"
